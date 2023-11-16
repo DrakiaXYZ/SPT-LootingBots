@@ -1,3 +1,7 @@
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+
 using DrakiaXYZ.BigBrain.Brains;
 
 using EFT;
@@ -15,6 +19,7 @@ namespace LootingBots.Brain.Logics
     {
         private readonly LootingBrain _lootingBrain;
         private readonly BotLog _log;
+        private readonly Collider[] _colliders;
 
         private float DetectCorpseDistance
         {
@@ -34,6 +39,7 @@ namespace LootingBots.Brain.Logics
         {
             _log = new BotLog(LootingBots.LootLog, botOwner);
             _lootingBrain = botOwner.GetPlayer.gameObject.GetComponent<LootingBrain>();
+            _colliders = new Collider[250];
         }
 
         public enum LootType
@@ -54,10 +60,7 @@ namespace LootingBots.Brain.Logics
 
         public void FindLootable()
         {
-            LootableContainer closestContainer = null;
-            LootItem closestItem = null;
-            BotOwner closestCorpse = null;
-            float shortestDist = -1f;
+            Stopwatch stopwatch = Stopwatch.StartNew();
 
             // Use the largest detection radius specified in the settings as the main Sphere radius
             float detectionRadius = Mathf.Max(
@@ -67,16 +70,36 @@ namespace LootingBots.Brain.Logics
             );
 
             // Cast a sphere on the bot, detecting any Interacive world objects that collide with the sphere
-            Collider[] array = Physics.OverlapSphere(
+            var colliderCount = Physics.OverlapSphereNonAlloc(
                 BotOwner.Position,
                 detectionRadius,
+                _colliders,
                 LootUtils.LootMask,
-                QueryTriggerInteraction.Collide
-            );
+                QueryTriggerInteraction.Collide);
 
-            // For each object detected, check to see if it is a lootable container and then calculate its distance from the player
-            foreach (Collider collider in array)
+            _log.LogInfo($"OverlapSphere: {stopwatch.ElapsedMilliseconds}ms  Items: {colliderCount}");
+            stopwatch.Restart();
+
+            // Create a list from just the newly added Colliders (OverlapSphereNonAlloc doesn't clear the array)
+            List<Collider> colliders = new List<Collider>();
+            for (int j = 0; j < colliderCount; j++) colliders.Add(_colliders[j]);
+
+            // Sort by nearest to bot location
+            colliders.Sort((a, b) =>
             {
+                var distA = Vector3.Distance(a.bounds.center, BotOwner.Position);
+                var distB = Vector3.Distance(b.bounds.center, BotOwner.Position);
+                return distA.CompareTo(distB);
+            });
+
+            _log.LogInfo($"Sort: {stopwatch.ElapsedMilliseconds}ms");
+            stopwatch.Restart();
+
+            // For each object detected, check to see if it is a lootable container and return the first valid entry, since it's sorted by distance already
+            foreach (Collider collider in colliders)
+            {
+                if (collider == null) continue;
+
                 LootableContainer container =
                     collider.gameObject.GetComponentInParent<LootableContainer>();
                 LootItem lootItem = collider.gameObject.GetComponentInParent<LootItem>();
@@ -114,13 +137,6 @@ namespace LootingBots.Brain.Logics
 
                 if (canLootContainer || canLootItem || canLootCorpse)
                 {
-                    Vector3 position =
-                        BotOwner.Position
-                        - (
-                            container?.transform.position
-                            ?? lootItem?.transform.position
-                            ?? corpse.GetPlayer.Transform.position
-                        );
                     Vector3 center = collider.bounds.center;
                     // Push the center point to the lowest y point in the collider. Extend it further down by .3f to help container positions of jackets snap to a valid NavMesh
                     center.y = collider.bounds.center.y - collider.bounds.extents.y - 0.4f;
@@ -137,53 +153,41 @@ namespace LootingBots.Brain.Logics
                     bool isInRange = IsLootInRange(lootType, destination, out float dist);
 
                     // If we are considering a lootable to be the new closest lootable, make sure the loot is in the detection range specified for the type of loot
-                    if (isInRange && (shortestDist == -1f || dist < shortestDist))
+                    if (isInRange)
                     {
                         if (canLootContainer)
                         {
-                            closestItem = null;
-                            closestCorpse = null;
-                            closestContainer = container;
+                            _lootingBrain.ActiveContainer = container;
+                            _lootingBrain.LootObjectPosition = container.transform.position;
+                            ActiveLootCache.CacheActiveLootId(container.Id, BotOwner.name);
+                            _lootingBrain.DistanceToLoot = dist;
+                            _lootingBrain.Destination = destination;
+                            break;
                         }
                         else if (canLootCorpse)
                         {
-                            closestItem = null;
-                            closestContainer = null;
-                            closestCorpse = corpse;
+                            _lootingBrain.ActiveCorpse = corpse;
+                            _lootingBrain.LootObjectPosition = corpse.Transform.position;
+                            ActiveLootCache.CacheActiveLootId(corpse.name, BotOwner.name);
+                            _lootingBrain.DistanceToLoot = dist;
+                            _lootingBrain.Destination = destination;
+                            break;
                         }
                         else
                         {
-                            closestCorpse = null;
-                            closestContainer = null;
-                            closestItem = lootItem;
+                            _lootingBrain.ActiveItem = lootItem;
+                            _lootingBrain.LootObjectPosition = lootItem.transform.position;
+                            ActiveLootCache.CacheActiveLootId(lootItem.ItemOwner.RootItem.Id, BotOwner.name);
+                            _lootingBrain.DistanceToLoot = dist;
+                            _lootingBrain.Destination = destination;
+                            break;
                         }
-
-                        shortestDist = dist;
-                        _lootingBrain.Destination = destination;
                     }
                 }
             }
 
-            if (closestContainer != null)
-            {
-                _lootingBrain.ActiveContainer = closestContainer;
-                _lootingBrain.LootObjectPosition = closestContainer.transform.position;
-                ActiveLootCache.CacheActiveLootId(closestContainer.Id, BotOwner.name);
-            }
-            else if (closestItem != null)
-            {
-                _lootingBrain.ActiveItem = closestItem;
-                _lootingBrain.LootObjectPosition = closestItem.transform.position;
-                ActiveLootCache.CacheActiveLootId(closestItem.ItemOwner.RootItem.Id, BotOwner.name);
-            }
-            else if (closestCorpse != null)
-            {
-                _lootingBrain.ActiveCorpse = closestCorpse;
-                _lootingBrain.LootObjectPosition = closestCorpse.Transform.position;
-                ActiveLootCache.CacheActiveLootId(closestCorpse.name, BotOwner.name);
-            }
-
-            _lootingBrain.DistanceToLoot = shortestDist;
+            stopwatch.Stop();
+            _log.LogInfo($"Loot search time: {stopwatch.ElapsedMilliseconds}ms");
         }
 
         /**
